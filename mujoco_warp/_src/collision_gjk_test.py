@@ -13,11 +13,13 @@
 # limitations under the License.
 # ==============================================================================
 
+import mujoco
 import numpy as np
 import warp as wp
 from absl.testing import absltest
 from absl.testing import parameterized
 
+import mujoco_warp as mjw
 from mujoco_warp import Data
 from mujoco_warp import GeomType
 from mujoco_warp import Model
@@ -1264,6 +1266,110 @@ class GJKTest(parameterized.TestCase):
     )
     # Expected dist is negative penetration depth: -0.05
     np.testing.assert_allclose(out_dist.numpy()[0], -0.05, atol=1e-4)
+
+  def test_box_mesh_resting_contact(self):
+    """Test box-mesh contacts at rest survive GJK stalling before a tetrahedron."""
+    # A can bottom penetrating a table top by 0.27 mm. The distance iteration reaches
+    # a triangle 36 um from the origin and used to stop there, dropping every contact.
+    table = [
+      -2.2256573484904947,
+      1.4779181821964082,
+      0.7190936196039271,
+      -0.0001061637760295295,
+      0.00010539895496268546,
+      0.7071068903380975,
+      -0.7071066562101496,
+    ]
+    cans = np.array(
+      [
+        [
+          -2.599997381399177,
+          1.3500004009205346,
+          0.7700893182245963,
+          -0.07454588057082986,
+          0.7031545696838638,
+          0.07452842543973674,
+          0.7031799745613447,
+        ],
+        [
+          -2.5999973821542413,
+          1.3500004004608572,
+          0.7700892586199263,
+          -0.07454587664490603,
+          0.7031545779962728,
+          0.07452842936570753,
+          0.7031799662493285,
+        ],
+        [
+          -2.5999973814047332,
+          1.350000401075317,
+          0.7700911659685881,
+          -0.07454588217756214,
+          0.7031545695716334,
+          0.07452842383299707,
+          0.7031799746735321,
+        ],
+        [
+          -2.5999973796375175,
+          1.350000402710239,
+          0.7700905103175687,
+          -0.07454589714743426,
+          0.703154549503661,
+          0.07452840886298771,
+          0.7031799947404214,
+        ],
+        [
+          -2.599997381460985,
+          1.3500004010228188,
+          0.7700925368754156,
+          -0.07454588169632803,
+          0.7031545702109118,
+          0.07452842431423562,
+          0.7031799740342883,
+        ],
+        [
+          -2.5999973822900597,
+          1.3500004002209172,
+          0.770090271898879,
+          -0.07454587431251508,
+          0.7031545796638893,
+          0.07452843169811452,
+          0.7031799645818283,
+        ],
+        [
+          -2.5999973807857035,
+          1.350000401435023,
+          0.770089139410686,
+          -0.07454588521877974,
+          0.7031545627756172,
+          0.07452842079174193,
+          0.7031799814692311,
+        ],
+        [
+          -2.5999973813117756,
+          1.3500004013960236,
+          0.770090331503571,
+          -0.07454588539216173,
+          0.7031545682587153,
+          0.074528420618379,
+          0.7031799759863249,
+        ],
+      ]
+    )
+    mjm, mjd, m, d = test_data.fixture("convex_collision/can_bottom.xml", nworld=len(cans), nconmax=64)
+    d.mocap_pos.assign(np.tile(table[:3], (len(cans), 1, 1)))
+    d.mocap_quat.assign(np.tile(table[3:], (len(cans), 1, 1)))
+    d.qpos.assign(cans)
+    mjw.forward(m, d)
+    nacon = d.nacon.numpy()[0]
+    worldid = d.contact.worldid.numpy()[:nacon]
+
+    mjd.mocap_pos[:] = table[:3]
+    mjd.mocap_quat[:] = table[3:]
+    for i, qpos in enumerate(cans):
+      mjd.qpos[:] = qpos
+      mujoco.mj_forward(mjm, mjd)
+      self.assertEqual((worldid == i).sum(), mjd.ncon, f"world {i}")
 
 
 if __name__ == "__main__":

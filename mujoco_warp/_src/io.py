@@ -386,6 +386,22 @@ def put_model(mjm: mujoco.MjModel, batch_sizes: dict[str, int] | None = None) ->
   m.stat = stat
   m.callback = types.Callback()
 
+  # The compiler's first three polygon vertices can be nearly collinear. Use the
+  # whole boundary for collision normals, without changing the host model.
+  if mjm.nmeshpoly:
+    starts = mjm.mesh_polyvertadr
+    counts = mjm.mesh_polyvertnum
+    vertex_base = np.repeat(mjm.mesh_vertadr, mjm.mesh_polynum)
+    vertices = mjm.mesh_polyvert + np.repeat(vertex_base, counts)
+    points = mjm.mesh_vert[vertices].astype(np.float64)
+    points -= np.repeat(points[starts], counts, axis=0)
+    following = np.arange(1, len(points) + 1)
+    following[starts + counts - 1] = starts
+    normals = np.add.reduceat(np.cross(points, points[following]), starts)
+    lengths = np.linalg.norm(normals, axis=1, keepdims=True)
+    m.mesh_polynormal = mjm.mesh_polynormal.copy()
+    np.divide(normals, lengths, out=m.mesh_polynormal, where=lengths > 0)
+
   m.nv_pad = _get_padded_sizes(
     mjm.nv,
     0,

@@ -626,7 +626,7 @@ def _gjk_support(
   simplex: mat43,
   n: int,
   is_discrete: bool,
-) -> Tuple[SupportPoint, SupportPoint]:
+) -> Tuple[SupportPoint, SupportPoint, wp.vec3]:
   dir_neg = x_k / x_norm
 
   # tuning for discrete geoms when direction is noisy
@@ -650,7 +650,128 @@ def _gjk_support(
 
   sp1 = support(geom1, geomtype1, -dir_neg)
   sp2 = support(geom2, geomtype2, dir_neg)
-  return sp1, sp2
+  return sp1, sp2, dir_neg
+
+
+@wp.func
+def _face_distance(v1: wp.vec3, v2: wp.vec3, v3: wp.vec3) -> Tuple[float, wp.vec3]:
+  """Signed distance from the origin to the plane of a tetrahedron face, with its normal."""
+  normal = wp.cross(v3 - v1, v2 - v1)
+  norm2 = wp.dot(normal, normal)
+  if norm2 > MINVAL2 and norm2 < MAXVAL2:
+    normal = normal / wp.sqrt(norm2)
+    return wp.dot(normal, v1), normal
+  return FLOAT_MAX, normal
+
+
+@wp.func
+def _gjk_intersect(
+  # In:
+  geom1: Geom,
+  geom2: Geom,
+  geomtype1: int,
+  geomtype2: int,
+  simplex_in: mat43,
+  simplex1_in: mat43,
+  simplex2_in: mat43,
+  simplex_index1_in: wp.vec4i,
+  simplex_index2_in: wp.vec4i,
+  iterations: int,
+) -> Tuple[int, GJKResult]:
+  """Decide from a tetrahedron whether the origin is inside the Minkowski difference.
+
+  Returns 1 with a tetrahedron containing the origin (ready for EPA), 0 if the geoms
+  are separated, or -1 if undecided (origin on a face plane or out of iterations).
+  """
+  simplex = simplex_in
+  simplex1 = simplex1_in
+  simplex2 = simplex2_in
+  simplex_index1 = simplex_index1_in
+  simplex_index2 = simplex_index2_in
+  s = wp.vec4i(0, 1, 2, 3)
+  result = GJKResult()
+  for _ in range(iterations):
+    # signed distance to each face along with normals
+    d0, n0 = _face_distance(simplex[s[2]], simplex[s[1]], simplex[s[3]])
+    d1, n1 = _face_distance(simplex[s[0]], simplex[s[2]], simplex[s[3]])
+    d2, n2 = _face_distance(simplex[s[1]], simplex[s[0]], simplex[s[3]])
+    d3, n3 = _face_distance(simplex[s[0]], simplex[s[1]], simplex[s[2]])
+
+    # if origin is on any affine hull, convergence will fail
+    if d0 == 0.0 or d1 == 0.0 or d2 == 0.0 or d3 == 0.0:
+      return -1, result
+
+    # find the face with the smallest distance to the origin
+    i = wp.where(d0 < d1, 0, 1)
+    j = wp.where(d2 < d3, 2, 3)
+    di = wp.where(i == 0, d0, d1)
+    dj = wp.where(j == 2, d2, d3)
+    index = wp.where(di < dj, i, j)
+
+    # origin inside of simplex (run EPA for contact information)
+    if wp.min(di, dj) > 0.0:
+      out = mat43()
+      out1 = mat43()
+      out2 = mat43()
+      out_index1 = wp.vec4i()
+      out_index2 = wp.vec4i()
+      for k in range(4):
+        out[k] = simplex[s[k]]
+        out1[k] = simplex1[s[k]]
+        out2[k] = simplex2[s[k]]
+        out_index1[k] = simplex_index1[s[k]]
+        out_index2[k] = simplex_index2[s[k]]
+      result.simplex = out
+      result.simplex1 = out1
+      result.simplex2 = out2
+      result.simplex_index1 = out_index1
+      result.simplex_index2 = out_index2
+      result.x1 = 0.25 * (out1[0] + out1[1] + out1[2] + out1[3])
+      result.x2 = 0.25 * (out2[0] + out2[1] + out2[2] + out2[3])
+      result.dim = 4
+      result.dist = 0.0
+      result.separated = False
+      result.index1 = geom1.index
+      result.index2 = geom2.index
+      return 1, result
+
+    normal = n3
+    if index == 0:
+      normal = n0
+    elif index == 1:
+      normal = n1
+    elif index == 2:
+      normal = n2
+
+    # replace worst vertex (farthest from origin) with new candidate
+    sp1 = support(geom1, geomtype1, normal)
+    geom1.index = sp1.cached_index
+    sp2 = support(geom2, geomtype2, -normal)
+    geom2.index = sp2.cached_index
+    v = s[index]
+    simplex1[v] = sp1.point
+    simplex2[v] = sp2.point
+    simplex_index1[v] = sp1.vertex_index
+    simplex_index2[v] = sp2.vertex_index
+    simplex[v] = sp1.point - sp2.point
+
+    # found origin outside the Minkowski difference (return no collision)
+    if wp.dot(normal, simplex[v]) < 0.0:
+      result.separated = True
+      result.dim = 0
+      result.dist = FLOAT_MAX
+      result.index1 = geom1.index
+      result.index2 = geom2.index
+      return 0, result
+
+    # swap vertices in the simplex to retain orientation
+    i = (index + 1) & 3
+    j = (index + 2) & 3
+    swap = s[i]
+    s[i] = s[j]
+    s[j] = swap
+
+  return -1, result
 
 
 @wp.func
@@ -687,12 +808,15 @@ def gjk(
   xnorm = wp.sqrt(wp.dot(x_k, x_k))
   xnorm_prev = float(0.0)
 
-  for _ in range(gjk_iterations):
+  # contact-only query: once a tetrahedron forms, decide penetration with the intersection test
+  backup = wp.where(cutoff == 0.0, 1, 0)
+
+  for k in range(gjk_iterations):
     if xnorm < min_norm or wp.abs(xnorm_prev - xnorm) < MINVAL:
       break
 
     # compute the support point with direction tuning
-    sp1, sp2 = _gjk_support(geom1, geom2, geomtype1, geomtype2, x_k, xnorm, simplex, n, is_discrete)
+    sp1, sp2, dir_neg = _gjk_support(geom1, geom2, geomtype1, geomtype2, x_k, xnorm, simplex, n, is_discrete)
     simplex1[n] = sp1.point
     geom1.index = sp1.cached_index
     simplex_index1[n] = sp1.vertex_index
@@ -704,14 +828,17 @@ def gjk(
     # compute the kth support point
     simplex[n] = simplex1[n] - simplex2[n]
 
+    # the support point minimizes the projection onto the queried direction, so lower
+    # bounds the distance between the geoms while xnorm upper bounds it
+    lower = wp.dot(dir_neg, simplex[n])
+
     # stopping criteria using the Frank-Wolfe duality gap given by
     #  |f(x_k) - f(x_min)|^2 <= < grad f(x_k), (x_k - simplex[n]) >
-    if wp.dot(x_k, x_k - simplex[n]) < epsilon:
+    # evaluated with the queried direction, which may differ from x_k after tuning
+    if xnorm * (xnorm - lower) < epsilon:
       break
 
-    # the lower bound on distance between the two geoms is (lower / x_norm)
     # if lower > 0, then the geoms are separated
-    lower = wp.dot(x_k, simplex[n])
     if cutoff == 0.0:
       if lower > 0.0:
         result = GJKResult()
@@ -722,7 +849,7 @@ def gjk(
         result.index2 = geom2.index
         return result
     elif cutoff < FLOAT_MAX:
-      if lower > 0.0 and lower >= cutoff * xnorm:
+      if lower > 0.0 and lower >= cutoff:
         result = GJKResult()
         result.separated = True
         result.dim = 0
@@ -730,6 +857,25 @@ def gjk(
         result.index1 = geom1.index
         result.index2 = geom2.index
         return result
+
+    # tetrahedron is generated and only contact info is needed; the intersection test
+    # decides penetration without relying on the distance iteration converging
+    if n == 3 and backup == 1:
+      ret, intersect = _gjk_intersect(
+        geom1,
+        geom2,
+        geomtype1,
+        geomtype2,
+        simplex,
+        simplex1,
+        simplex2,
+        simplex_index1,
+        simplex_index2,
+        gjk_iterations - k,
+      )
+      if ret != -1:
+        return intersect
+      backup = 0
 
     # run the distance subalgorithm to compute the barycentric coordinates
     # of the closest point to the origin in the simplex

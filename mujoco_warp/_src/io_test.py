@@ -445,6 +445,50 @@ _MESH_RANDOMIZE_XML = """
 
 
 class IOTest(parameterized.TestCase):
+  @parameterized.parameters(1.0, 0.01, 100.0)
+  def test_mesh_polygon_normals_collinear_boundary(self, scale):
+    """Mesh polygon normals use the whole face, including after mesh transforms."""
+    vertices = np.array(
+      [
+        [sx * half_x, sy * 0.013, z]
+        for z, half_x in [(-0.02925, 0.0255), (-0.028, 0.025505), (0.028, 0.025505), (0.02925, 0.0255)]
+        for sx, sy in [(-1, -1), (-1, 1), (1, -1), (1, 1)]
+      ]
+    )
+    spec = mujoco.MjSpec()
+    spec.add_mesh(name="tetra", uservert=[0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1])
+    spec.worldbody.add_geom(type=mujoco.mjtGeom.mjGEOM_MESH, meshname="tetra")
+    for i, angle in enumerate((0.0, 0.7)):
+      rotation = np.array(
+        [
+          [np.cos(angle), -np.sin(angle), 0],
+          [np.sin(angle), np.cos(angle), 0],
+          [0, 0, 1],
+        ]
+      )
+      points = scale * (vertices @ rotation.T + [0.03, -0.01, 0.02])
+      spec.add_mesh(name=f"beveled{i}", uservert=points.ravel())
+      spec.worldbody.add_geom(type=mujoco.mjtGeom.mjGEOM_MESH, meshname=f"beveled{i}")
+    host = spec.compile()
+    original = host.mesh_polynormal.copy()
+    model = put_model(host)
+    normals = model.mesh_polynormal.numpy()
+    np.testing.assert_array_equal(host.mesh_polynormal, original)
+    for mesh in range(host.nmesh):
+      start = host.mesh_polyadr[mesh]
+      for polygon in range(start, start + host.mesh_polynum[mesh]):
+        adr, count = host.mesh_polyvertadr[polygon], host.mesh_polyvertnum[polygon]
+        points = host.mesh_vert[host.mesh_vertadr[mesh] + host.mesh_polyvert[adr : adr + count]].astype(float)
+        centered = points - points.mean(axis=0)
+        normal = normals[polygon]
+        self.assertAlmostEqual(np.linalg.norm(normal), 1.0, places=6)
+        # A normal is perpendicular to the face, and points away from the hull centroid.
+        extent = np.linalg.norm(np.ptp(points, axis=0))
+        self.assertLess(np.max(np.abs(centered @ normal)), 1e-3 * extent)
+        va, vn = host.mesh_vertadr[mesh], host.mesh_vertnum[mesh]
+        outward = points.mean(axis=0) - host.mesh_vert[va : va + vn].mean(axis=0)
+        self.assertGreater(normal @ outward, 0.0)
+
   @parameterized.named_parameters(
     dict(
       testcase_name="control_timestamps",

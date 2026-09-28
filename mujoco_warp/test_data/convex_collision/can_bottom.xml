@@ -1,0 +1,18 @@
+<mujoco>
+  <compiler meshdir="../meshes"/>
+  <option ccd_iterations="35">
+    <flag multiccd="enable"/>
+  </option>
+  <asset>
+    <mesh name="can_bottom" file="can_bottom.stl"/>
+  </asset>
+  <worldbody>
+    <body name="table" mocap="true">
+      <geom type="box" size="1.10703325 0.05026174 0.61995101"/>
+    </body>
+    <body name="can_bottom">
+      <freejoint/>
+      <geom type="mesh" mesh="can_bottom"/>
+    </body>
+  </worldbody>
+</mujoco>
